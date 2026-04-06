@@ -1,0 +1,38 @@
+# Xcode
+#
+# gitignore contributors: add or modify form at https://github.com/github/gitignore
+
+## Build results
+build/
+DerivedData/
+
+## Various settings
+*.pbxuser
+!default.pbxuser
+*.mode1v3
+!default.mode1v3
+*.mode2v3
+!default.mode2v3
+*.perspectivev3
+!default.perspectivev3
+xcuserdata/
+
+## Other
+*.bundle
+*.lib
+*.swp
+*.lock
+DS_Store
+.DS_Store
+
+## Swift Package Manager
+.build/
+.swiftpm/
+
+## UserData
+ChirpAI.xcodeproj/xcuserdata/
+ChirpAI.xcodeproj/project.xcworkspace/xcuserdata/
+
+## Local-only
+.vscode/
+tmp/
