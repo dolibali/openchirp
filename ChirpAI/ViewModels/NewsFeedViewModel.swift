@@ -15,12 +15,15 @@ class NewsFeedViewModel: ObservableObject {
     @Published var showFeedbackSheet = false
     @Published var selectedNewsForFeedback: NewsItem?
     @Published var defaultFeedbackAction: FeedbackAction = .like
+    @Published var showProfileUpdateFailureAlert = false
+    @Published var profileUpdateFailureMessage = ""
 
     private let modelContext: ModelContext
     private let preferenceManager: PreferenceManager
     private let glmService = GLMService()
     private let newsFetcher: NewsFetcher
     private var cancellables = Set<AnyCancellable>()
+    private var isUpdatingProfile = false
 
     init(modelContext: ModelContext, preferenceManager: PreferenceManager) {
         self.modelContext = modelContext
@@ -52,6 +55,10 @@ class NewsFeedViewModel: ObservableObject {
 
     func fetchNext() async {
         await newsFetcher.fetchNextNews()
+
+        if !newsFetcher.statusMessage.contains("获取失败") {
+            await retryPendingProfileUpdateIfNeeded()
+        }
         
         let finalMsg = newsFetcher.statusMessage
         if !finalMsg.isEmpty {
@@ -126,16 +133,41 @@ class NewsFeedViewModel: ObservableObject {
     }
     
     private func checkAndRunProfileUpdate() async {
-        let totalFeedbacks = preferenceManager.getFeedbackCount()
-        // Only run after every 5 feedbacks
-        guard totalFeedbacks > 0 && totalFeedbacks % 5 == 0 else {
+        let pendingCount = preferenceManager.getPendingFeedbackCount()
+        let threshold = preferenceManager.getAutoProfileRefreshThreshold()
+        // 仅在新增反馈累计到一定数量时自动更新，避免重复消费旧记录
+        guard pendingCount > 0 && pendingCount % threshold == 0 else {
             return
         }
-        
-        do {
-            let feedbacks = preferenceManager.getRecentFeedbacks(limit: 20)
-            let currentProfile = preferenceManager.getCurrentProfileSummary()
 
+        let feedbacks = preferenceManager.getPendingFeedbacks(limit: 30)
+        await runProfileUpdate(with: feedbacks, showFailureAlert: true)
+    }
+
+    func openFeedbackSheet(for news: NewsItem, defaultAction: FeedbackAction) {
+        selectedNewsForFeedback = news
+        defaultFeedbackAction = defaultAction
+        showFeedbackSheet = true
+    }
+
+    func retryPendingProfileUpdateIfNeeded() async {
+        guard preferenceManager.needsProfileRefresh() else { return }
+        let feedbacks = preferenceManager.getPendingFeedbacks(limit: 30)
+        guard !feedbacks.isEmpty else {
+            preferenceManager.setNeedsProfileRefresh(false)
+            return
+        }
+
+        await runProfileUpdate(with: feedbacks, showFailureAlert: false)
+    }
+
+    private func runProfileUpdate(with feedbacks: [Feedback], showFailureAlert: Bool) async {
+        guard !feedbacks.isEmpty, !isUpdatingProfile else { return }
+        isUpdatingProfile = true
+        defer { isUpdatingProfile = false }
+
+        do {
+            let currentProfile = preferenceManager.getCurrentProfileSummary()
             let newSummary = try await glmService.updateProfile(
                 currentProfile: currentProfile,
                 recentFeedbacks: feedbacks.map { fb in
@@ -143,14 +175,17 @@ class NewsFeedViewModel: ObservableObject {
                 }
             )
             preferenceManager.saveProfile(summary: newSummary)
+            preferenceManager.markFeedbacksIncorporated(feedbacks)
+            preferenceManager.setNeedsProfileRefresh(false)
         } catch {
-            print("AI 画像自动更新失败: \(error)")
-        }
-    }
+            let message = error.localizedDescription
+            print("AI 画像自动更新失败: \(message)")
+            preferenceManager.setNeedsProfileRefresh(true, failureMessage: message)
 
-    func openFeedbackSheet(for news: NewsItem, defaultAction: FeedbackAction) {
-        selectedNewsForFeedback = news
-        defaultFeedbackAction = defaultAction
-        showFeedbackSheet = true
+            if showFailureAlert {
+                profileUpdateFailureMessage = "画像自动更新失败。你可以前往设置里的“我的画像与调教”，点击“立即更新画像”重试。\n\n错误信息：\(message)"
+                showProfileUpdateFailureAlert = true
+            }
+        }
     }
 }

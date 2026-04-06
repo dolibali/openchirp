@@ -36,3 +36,4 @@ ChirpAI.xcodeproj/project.xcworkspace/xcuserdata/
 ## Local-only
 .vscode/
 tmp/
+docs/plan

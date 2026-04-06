@@ -32,6 +32,7 @@ struct NewsFeedContentView: View {
     @StateObject var viewModel: NewsFeedViewModel
     @State private var selectedNews: NewsItem?
     @State private var showLogPanel = false
+    @State private var showSettings = false
 
     var body: some View {
         NavigationStack {
@@ -119,7 +120,9 @@ struct NewsFeedContentView: View {
                     }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
-                    NavigationLink(destination: SettingsView()) {
+                    Button {
+                        showSettings = true
+                    } label: {
                         Image(systemName: "gearshape")
                     }
                 }
@@ -163,13 +166,27 @@ struct NewsFeedContentView: View {
                     NewsDetailView(news: news)
                 }
             }
+            .navigationDestination(isPresented: $showSettings) {
+                SettingsView()
+            }
             .onAppear {
                 viewModel.loadNews()
+                Task {
+                    await viewModel.retryPendingProfileUpdateIfNeeded()
+                }
             }
             .alert("提取结果", isPresented: $viewModel.showAlert) {
                 Button("确定", role: .cancel) { }
             } message: {
                 Text(viewModel.alertMessage)
+            }
+            .alert("画像更新失败", isPresented: $viewModel.showProfileUpdateFailureAlert) {
+                Button("前往设置") {
+                    showSettings = true
+                }
+                Button("稍后再说", role: .cancel) { }
+            } message: {
+                Text(viewModel.profileUpdateFailureMessage)
             }
         }
     }

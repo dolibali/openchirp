@@ -119,7 +119,7 @@ class GLMService {
                 feedbackList += "跳过"
             }
             if let text = fb.textFeedback, !text.isEmpty {
-                feedbackList += "，文字反馈：\(text)"
+                feedbackList += "\n  【显式文字反馈（最高优先级）】：\(text)"
             }
             feedbackList += "\n  推文：\(fb.newsTitle)"
             feedbackList += "\n  摘要：\(fb.newsSummary.prefix(80))\n\n"
@@ -133,7 +133,74 @@ class GLMService {
         最近反馈记录：
         \(feedbackList)
 
+        注意：如果某条记录里带有“显式文字反馈（最高优先级）”，请优先依据该文字反馈理解用户真实意图。
+
         请结合当前画像和最新反馈，输出更新后的结构化用户偏好画像。
+        """
+
+        let response = try await callAPI(
+            systemPrompt: SystemPrompts.updateProfile,
+            userMessage: userMessage,
+            tools: tools
+        )
+
+        let args = try extractToolCall(response, toolName: "update_profile")
+        guard let summary = args["profile_summary"] as? String else {
+            throw GLMError.invalidToolArgs
+        }
+        return summary
+    }
+
+    func rebuildProfileFromHistory(
+        allFeedbacks: [(action: String, textFeedback: String?, newsTitle: String, newsSummary: String)]
+    ) async throws -> String {
+        let tools: [[String: Any]] = [
+            [
+                "type": "function",
+                "function": [
+                    "name": "update_profile",
+                    "description": "基于全部历史反馈重建结构化用户偏好画像",
+                    "parameters": [
+                        "type": "object",
+                        "properties": [
+                            "profile_summary": ["type": "string", "description": "包含核心偏好、近期追踪、避雷不看的结构化画像文本"]
+                        ],
+                        "required": ["profile_summary"]
+                    ]
+                ]
+            ]
+        ]
+
+        var feedbackList = ""
+        for (i, fb) in allFeedbacks.enumerated() {
+            feedbackList += "历史反馈\(i + 1)："
+            if fb.action == "like" {
+                feedbackList += "点赞强烈推荐"
+            } else if fb.action == "neutral" {
+                feedbackList += "一般(已阅但反响平平)"
+            } else if fb.action == "dislike" {
+                feedbackList += "点踩极度反感"
+            } else {
+                feedbackList += "跳过"
+            }
+            if let text = fb.textFeedback, !text.isEmpty {
+                feedbackList += "\n  【显式文字反馈（最高优先级）】：\(text)"
+            }
+            feedbackList += "\n  推文：\(fb.newsTitle)"
+            feedbackList += "\n  摘要：\(fb.newsSummary.prefix(80))\n\n"
+        }
+
+        let userMessage = """
+        下面是用户的全部历史反馈记录（按时间顺序排列，从早到晚）：
+
+        \(feedbackList)
+
+        请忽略旧画像，直接基于这些完整历史反馈重建一版新的结构化用户画像。
+        要兼顾：
+        1. 从全部历史里抽取长期稳定的核心偏好
+        2. 从较新的反馈里提取近期追踪
+        3. 从全部历史里总结稳定的避雷不看
+        4. 如果有显式文字反馈，优先以文字反馈为准
         """
 
         let response = try await callAPI(

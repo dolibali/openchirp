@@ -82,12 +82,23 @@ class NewsFetcher: ObservableObject {
 
         do {
             let sources = loadRSSSources()
+            let lookbackDays = preferenceManager.getRSSFetchLookbackDays()
+            let recentThresholdDate = Calendar.current.date(byAdding: .day, value: -lookbackDays, to: Date()) ?? .distantPast
             var allCandidates: [(title: String, summary: String, source: String, link: String, pubDate: Date, rawSource: RSSSource)] = []
+
+            appendLog("🗓️ 抓取策略：只扫描最近 \(lookbackDays) 天的文章")
 
             for source in sources {
                 if let items = try? await fetchRSSItems(from: source) {
                     var added = 0
-                    for item in items {   // 不再限制每源条数，全部交给 AI 评判
+                    var skippedOld = 0
+                    for item in items {
+                        let publishedAt = item.pubDate ?? Date()
+                        guard publishedAt >= recentThresholdDate else {
+                            skippedOld += 1
+                            continue
+                        }
+
                         let urlHash = HashUtil.md5(item.link)
                         if !preferenceManager.isNewsSeen(urlHash: urlHash) {
                             allCandidates.append((
@@ -95,13 +106,17 @@ class NewsFetcher: ObservableObject {
                                 summary: item.description,
                                 source: item.source,
                                 link: item.link,
-                                pubDate: item.pubDate ?? Date(),
+                                pubDate: publishedAt,
                                 rawSource: source
                             ))
                             added += 1
                         }
                     }
-                    appendLog("➤ 扫描 [\(source.name)]: 发现 \(added) 篇候选")
+                    if skippedOld > 0 {
+                        appendLog("➤ 扫描 [\(source.name)]: 发现 \(added) 篇候选，过滤旧文 \(skippedOld) 篇")
+                    } else {
+                        appendLog("➤ 扫描 [\(source.name)]: 发现 \(added) 篇候选")
+                    }
                 } else {
                     appendLog("➤ 扫描 [\(source.name)]: 连接超时或被拒绝，跳过")
                 }
