@@ -44,7 +44,8 @@ struct AgentLogPanel: View {
                             }
                             .padding(16)
                         }
-                        .onChange(of: logs.count) { _ in
+                        .onChange(of: logs.count) {
+                            guard !logs.isEmpty else { return }
                             withAnimation {
                                 proxy.scrollTo(logs.count - 1, anchor: .bottom)
                             }
