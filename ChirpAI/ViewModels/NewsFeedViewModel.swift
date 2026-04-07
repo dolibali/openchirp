@@ -17,6 +17,7 @@ class NewsFeedViewModel: ObservableObject {
     @Published var defaultFeedbackAction: FeedbackAction = .like
     @Published var showProfileUpdateFailureAlert = false
     @Published var profileUpdateFailureMessage = ""
+    @Published var fetchStage: FetchStage = .idle
 
     private let modelContext: ModelContext
     private let preferenceManager: PreferenceManager
@@ -45,6 +46,11 @@ class NewsFeedViewModel: ObservableObject {
             .receive(on: RunLoop.main)
             .assign(to: \.isFetching, on: self)
             .store(in: &cancellables)
+
+        newsFetcher.$currentStage
+            .receive(on: RunLoop.main)
+            .assign(to: \.fetchStage, on: self)
+            .store(in: &cancellables)
     }
 
     func loadNews() {
@@ -64,19 +70,11 @@ class NewsFeedViewModel: ObservableObject {
     }
 
     func fetchNext() async {
-        await newsFetcher.fetchNextNews()
-
-        if !newsFetcher.statusMessage.contains("获取失败") {
-            await retryPendingProfileUpdateIfNeeded()
+        let resumed = await newsFetcher.resumeInterruptedFetchIfNeeded()
+        if !resumed {
+            await newsFetcher.fetchNextNews()
         }
-        
-        let finalMsg = newsFetcher.statusMessage
-        if !finalMsg.isEmpty {
-            alertMessage = finalMsg
-            showAlert = true
-        }
-        
-        loadNews()
+        await handleFetchCompletion()
     }
     
     func deleteNews(_ news: NewsItem) {
@@ -238,6 +236,16 @@ class NewsFeedViewModel: ObservableObject {
         await runProfileUpdate(with: feedbacks, showFailureAlert: false)
     }
 
+    func handleEnteredBackground() {
+        newsFetcher.noteEnteredBackground()
+    }
+
+    func handleBecameActive() async {
+        let resumed = await newsFetcher.resumeInterruptedFetchIfNeeded()
+        guard resumed else { return }
+        await handleFetchCompletion()
+    }
+
     private func runProfileUpdate(with feedbacks: [Feedback], showFailureAlert: Bool) async {
         guard !feedbacks.isEmpty, !isUpdatingProfile else { return }
         isUpdatingProfile = true
@@ -268,5 +276,21 @@ class NewsFeedViewModel: ObservableObject {
                 showProfileUpdateFailureAlert = true
             }
         }
+    }
+
+    private func handleFetchCompletion() async {
+        let currentStage = newsFetcher.currentStage
+
+        if currentStage != .interrupted && !newsFetcher.statusMessage.contains("获取失败") && !newsFetcher.statusMessage.contains("恢复失败") {
+            await retryPendingProfileUpdateIfNeeded()
+        }
+
+        let finalMsg = newsFetcher.statusMessage
+        if currentStage != .interrupted && !finalMsg.isEmpty {
+            alertMessage = finalMsg
+            showAlert = true
+        }
+
+        loadNews()
     }
 }

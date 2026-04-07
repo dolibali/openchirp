@@ -1,6 +1,37 @@
 import Foundation
 import SwiftData
 import Combine
+import UIKit
+
+enum FetchStage: String {
+    case idle
+    case fetchingRSS
+    case preselecting
+    case ranking
+    case interrupted
+    case failed
+}
+
+private enum RecoverableAIStage: String {
+    case preselecting
+    case ranking
+}
+
+private struct CandidateArticle {
+    let title: String
+    let summary: String
+    let source: String
+    let link: String
+    let pubDate: Date
+}
+
+private struct AIFetchRecoveryState {
+    var stage: RecoverableAIStage
+    let allCandidates: [CandidateArticle]
+    var filteredCandidates: [CandidateArticle]
+    let profileSummary: String
+    let seenTitles: [String]
+}
 
 struct RSSSource: Codable, Identifiable {
     var id: UUID
@@ -54,6 +85,7 @@ class NewsFetcher: ObservableObject {
     @Published var isFetching = false
     @Published var statusMessage = ""
     @Published var fetchLogs: [String] = []
+    @Published private(set) var currentStage: FetchStage = .idle
 
     private let modelContext: ModelContext
     private let preferenceManager: PreferenceManager
@@ -61,6 +93,9 @@ class NewsFetcher: ObservableObject {
     private let rssParser = RSSParser()
     private let diagnostics = AppDiagnosticsLogger.shared
     private let session: URLSession
+    private var recoveryState: AIFetchRecoveryState?
+    private var didEnterBackgroundDuringAIStage = false
+    private var backgroundTaskID: UIBackgroundTaskIdentifier = .invalid
 
     init(modelContext: ModelContext, preferenceManager: PreferenceManager) {
         self.modelContext = modelContext
@@ -72,24 +107,19 @@ class NewsFetcher: ObservableObject {
 
     func fetchNextNews() async {
         guard !isFetching else { return }
-        isFetching = true
-        fetchLogs = []
-        
-        let appendLog: (String) -> Void = { msg in
-            self.fetchLogs.append(msg)
-            self.statusMessage = msg
-        }
-        
+        prepareFreshFetch()
+
         appendLog("🧹 清理历史冗余...")
         deleteOldNewsItems()
-        
+
+        currentStage = .fetchingRSS
         appendLog("🚀 初始化 RSS 探针...")
 
         do {
             let sources = loadRSSSources()
             let lookbackDays = preferenceManager.getRSSFetchLookbackDays()
             let recentThresholdDate = Calendar.current.date(byAdding: .day, value: -lookbackDays, to: Date()) ?? .distantPast
-            var allCandidates: [(title: String, summary: String, source: String, link: String, pubDate: Date, rawSource: RSSSource)] = []
+            var allCandidates: [CandidateArticle] = []
 
             appendLog("🗓️ 抓取策略：只扫描最近 \(lookbackDays) 天的文章")
 
@@ -107,13 +137,12 @@ class NewsFetcher: ObservableObject {
 
                         let urlHash = HashUtil.md5(item.link)
                         if !preferenceManager.isNewsSeen(urlHash: urlHash) {
-                            allCandidates.append((
+                            allCandidates.append(CandidateArticle(
                                 title: item.title,
                                 summary: item.description,
                                 source: item.source,
                                 link: item.link,
-                                pubDate: publishedAt,
-                                rawSource: source
+                                pubDate: publishedAt
                             ))
                             added += 1
                         }
@@ -139,96 +168,141 @@ class NewsFetcher: ObservableObject {
 
             guard !allCandidates.isEmpty else {
                 appendLog("✅ 源数据收集完毕: 0 篇新候选推文")
-                isFetching = false
+                finishFetch()
                 return
             }
 
             appendLog("✅ 源数据收集完毕，共发现 \(allCandidates.count) 篇候选文章")
             let profileSummary = preferenceManager.getCurrentProfileSummary() ?? "新用户，暂无偏好数据"
             let seenTitles = preferenceManager.getSeenTitles()
+            recoveryState = AIFetchRecoveryState(
+                stage: .preselecting,
+                allCandidates: allCandidates,
+                filteredCandidates: [],
+                profileSummary: profileSummary,
+                seenTitles: seenTitles
+            )
+            startBackgroundProtectionIfNeeded()
 
             // ── 第一阶段：只发标题给 AI 粗选（极低 token）──
-            appendLog("🔍 [第1阶段] 发送 \(allCandidates.count) 个标题给 AI 粗筛...")
-            let allTitles = allCandidates.map { $0.title }
-            let preselectIndices = try await glmService.preselectByTitle(
-                titles: allTitles,
-                userProfile: profileSummary,
+            let filteredCandidates = try await runPreselect(
+                allCandidates: allCandidates,
+                profileSummary: profileSummary,
                 seenTitles: seenTitles
             )
 
-            guard !preselectIndices.isEmpty else {
+            guard !filteredCandidates.isEmpty else {
                 appendLog("✅ [第1阶段] AI 判定：无标题符合偏好，本次跳过。")
-                isFetching = false
+                finishFetch()
                 return
             }
-
-            let filteredCandidates = preselectIndices
-                .filter { $0 >= 0 && $0 < allCandidates.count }
-                .map { allCandidates[$0] }
 
             appendLog("✅ [第1阶段] 粗筛保留 \(filteredCandidates.count) 篇，进入精排...")
+            recoveryState?.stage = .ranking
+            recoveryState?.filteredCandidates = filteredCandidates
 
             // ── 第二阶段：携带完整摘要精排（高质量决策）──
-            appendLog("🧠 [第2阶段] 发送完整摘要，进行精选与推荐理由生成...")
-            let candidatesForAI = filteredCandidates.map { (title: $0.title, summary: $0.summary, source: $0.source) }
-            let pickResults = try await glmService.pickBestNews(
-                candidates: candidatesForAI,
-                userProfile: profileSummary,
+            let pickResults = try await runRanking(
+                filteredCandidates: filteredCandidates,
+                profileSummary: profileSummary,
                 seenTitles: seenTitles
             )
 
-            if pickResults.isEmpty {
-                appendLog("✅ [第2阶段] 精排后判定：暂无值得推送的内容，宁缺毋滥。")
-                isFetching = false
+            try finalizeRankingResults(pickResults, filteredCandidates: filteredCandidates)
+            finishFetch()
+        } catch {
+            if handleInterruptedAIRequestIfNeeded(error) {
                 return
             }
 
-            for pickResult in pickResults {
-                guard pickResult.index >= 0 && pickResult.index < filteredCandidates.count else {
-                    continue
-                }
-
-                let selected = filteredCandidates[pickResult.index]
-
-                let newsItem = NewsItem(
-                    title: selected.title,
-                    summary: selected.summary,
-                    content: "",
-                    sourceURL: selected.link,
-                    sourceName: selected.source,
-                    publishedAt: selected.pubDate,
-                    fetchedAt: Date(),
-                    reasoning: pickResult.reasoning
-                )
-                modelContext.insert(newsItem)
-
-                let urlHash = HashUtil.md5(selected.link)
-                preferenceManager.markNewsSeen(urlHash: urlHash, title: selected.title)
-
-                appendLog("🎉 精选成功：[\(selected.source)] \(selected.title)")
-            }
-
-            do {
-                try modelContext.save()
-            } catch {
-                diagnostics.error(
-                    domain: "storage",
-                    message: "保存精选新闻失败",
-                    metadata: ["error": error.localizedDescription]
-                )
-                throw error
-            }
-
-            // 完成汇总
-            let count = pickResults.filter { $0.index >= 0 && $0.index < filteredCandidates.count }.count
-            appendLog("✅ 完成！本次为您精选了 \(count) 篇推文")
-            statusMessage = "本次为您精选了 \(count) 篇推文 🎉"
-        } catch {
+            currentStage = .failed
+            diagnostics.error(
+                domain: "network",
+                message: "新闻抓取流程失败",
+                metadata: [
+                    "stage": currentStage.rawValue,
+                    "error": error.localizedDescription
+                ]
+            )
             appendLog("❌ 获取失败：\(error.localizedDescription)")
             statusMessage = "获取失败：\(error.localizedDescription)"
+            finishFetch(clearRecoveryState: true)
+        }
+    }
+
+    func noteEnteredBackground() {
+        guard isFetching, currentStage == .preselecting || currentStage == .ranking else { return }
+        guard !didEnterBackgroundDuringAIStage else { return }
+        didEnterBackgroundDuringAIStage = true
+        appendLog("⏸️ 已切到后台，若本次 AI 请求被系统中断，回到前台后会自动从当前阶段恢复。")
+    }
+
+    func resumeInterruptedFetchIfNeeded() async -> Bool {
+        guard !isFetching, currentStage == .interrupted, let recoveryState else { return false }
+
+        didEnterBackgroundDuringAIStage = false
+        isFetching = true
+        startBackgroundProtectionIfNeeded()
+
+        let stageDescription = recoveryState.stage == .preselecting ? "标题粗筛" : "精选重排"
+        appendLog("🔄 已回到前台，正在恢复 AI \(stageDescription)...")
+
+        do {
+            switch recoveryState.stage {
+            case .preselecting:
+                let filteredCandidates = try await runPreselect(
+                    allCandidates: recoveryState.allCandidates,
+                    profileSummary: recoveryState.profileSummary,
+                    seenTitles: recoveryState.seenTitles
+                )
+
+                guard !filteredCandidates.isEmpty else {
+                    appendLog("✅ [第1阶段] AI 判定：无标题符合偏好，本次跳过。")
+                    finishFetch()
+                    return true
+                }
+
+                appendLog("✅ [第1阶段] 粗筛保留 \(filteredCandidates.count) 篇，进入精排...")
+                self.recoveryState?.stage = .ranking
+                self.recoveryState?.filteredCandidates = filteredCandidates
+
+                let pickResults = try await runRanking(
+                    filteredCandidates: filteredCandidates,
+                    profileSummary: recoveryState.profileSummary,
+                    seenTitles: recoveryState.seenTitles
+                )
+                try finalizeRankingResults(pickResults, filteredCandidates: filteredCandidates)
+
+            case .ranking:
+                let pickResults = try await runRanking(
+                    filteredCandidates: recoveryState.filteredCandidates,
+                    profileSummary: recoveryState.profileSummary,
+                    seenTitles: recoveryState.seenTitles
+                )
+                try finalizeRankingResults(pickResults, filteredCandidates: recoveryState.filteredCandidates)
+            }
+
+            finishFetch()
+        } catch {
+            if handleInterruptedAIRequestIfNeeded(error) {
+                return true
+            }
+
+            currentStage = .failed
+            diagnostics.error(
+                domain: "network",
+                message: "恢复被中断的 AI 抓取流程失败",
+                metadata: [
+                    "stage": recoveryState.stage.rawValue,
+                    "error": error.localizedDescription
+                ]
+            )
+            appendLog("❌ 恢复失败：\(error.localizedDescription)")
+            statusMessage = "恢复失败：\(error.localizedDescription)"
+            finishFetch(clearRecoveryState: true)
         }
 
-        isFetching = false
+        return true
     }
 
     private func fetchRSSItems(from source: RSSSource) async throws -> [RSSItem] {
@@ -260,7 +334,179 @@ class NewsFetcher: ObservableObject {
     func loadRSSSources() -> [RSSSource] {
         RSSSourceManager.shared.loadEnabledSources()
     }
-    
+
+    private func prepareFreshFetch() {
+        isFetching = true
+        fetchLogs = []
+        statusMessage = ""
+        currentStage = .idle
+        recoveryState = nil
+        didEnterBackgroundDuringAIStage = false
+        endBackgroundProtectionIfNeeded()
+    }
+
+    private func appendLog(_ message: String) {
+        fetchLogs.append(message)
+        statusMessage = message
+    }
+
+    private func runPreselect(
+        allCandidates: [CandidateArticle],
+        profileSummary: String,
+        seenTitles: [String]
+    ) async throws -> [CandidateArticle] {
+        currentStage = .preselecting
+        appendLog("🔍 [第1阶段] 发送 \(allCandidates.count) 个标题给 AI 粗筛...")
+
+        let allTitles = allCandidates.map { $0.title }
+        let preselectIndices = try await glmService.preselectByTitle(
+            titles: allTitles,
+            userProfile: profileSummary,
+            seenTitles: seenTitles
+        )
+
+        return preselectIndices
+            .filter { $0 >= 0 && $0 < allCandidates.count }
+            .map { allCandidates[$0] }
+    }
+
+    private func runRanking(
+        filteredCandidates: [CandidateArticle],
+        profileSummary: String,
+        seenTitles: [String]
+    ) async throws -> [(index: Int, reasoning: String)] {
+        currentStage = .ranking
+        appendLog("🧠 [第2阶段] 发送完整摘要，进行精选与推荐理由生成...")
+
+        let candidatesForAI = filteredCandidates.map { (title: $0.title, summary: $0.summary, source: $0.source) }
+        return try await glmService.pickBestNews(
+            candidates: candidatesForAI,
+            userProfile: profileSummary,
+            seenTitles: seenTitles
+        )
+    }
+
+    private func finalizeRankingResults(
+        _ pickResults: [(index: Int, reasoning: String)],
+        filteredCandidates: [CandidateArticle]
+    ) throws {
+        if pickResults.isEmpty {
+            appendLog("✅ [第2阶段] 精排后判定：暂无值得推送的内容，宁缺毋滥。")
+            return
+        }
+
+        for pickResult in pickResults {
+            guard pickResult.index >= 0 && pickResult.index < filteredCandidates.count else {
+                continue
+            }
+
+            let selected = filteredCandidates[pickResult.index]
+
+            let newsItem = NewsItem(
+                title: selected.title,
+                summary: selected.summary,
+                content: "",
+                sourceURL: selected.link,
+                sourceName: selected.source,
+                publishedAt: selected.pubDate,
+                fetchedAt: Date(),
+                reasoning: pickResult.reasoning
+            )
+            modelContext.insert(newsItem)
+
+            let urlHash = HashUtil.md5(selected.link)
+            preferenceManager.markNewsSeen(urlHash: urlHash, title: selected.title)
+
+            appendLog("🎉 精选成功：[\(selected.source)] \(selected.title)")
+        }
+
+        do {
+            try modelContext.save()
+        } catch {
+            diagnostics.error(
+                domain: "storage",
+                message: "保存精选新闻失败",
+                metadata: ["error": error.localizedDescription]
+            )
+            throw error
+        }
+
+        let count = pickResults.filter { $0.index >= 0 && $0.index < filteredCandidates.count }.count
+        appendLog("✅ 完成！本次为您精选了 \(count) 篇推文")
+        statusMessage = "本次为您精选了 \(count) 篇推文 🎉"
+    }
+
+    private func handleInterruptedAIRequestIfNeeded(_ error: Error) -> Bool {
+        guard didEnterBackgroundDuringAIStage,
+              recoveryState != nil,
+              currentStage == .preselecting || currentStage == .ranking,
+              isRecoverableBackgroundInterruption(error) else {
+            return false
+        }
+
+        let stageText = currentStage == .preselecting ? "标题粗筛" : "精选重排"
+        diagnostics.warning(
+            domain: "network",
+            message: "AI 请求在后台切换后被中断，等待回前台恢复",
+            metadata: [
+                "stage": currentStage.rawValue,
+                "error": error.localizedDescription
+            ]
+        )
+        currentStage = .interrupted
+        appendLog("⏸️ \(stageText) 在后台被系统中断，回到前台后会自动从当前阶段继续。")
+        finishFetch(clearRecoveryState: false, resetStageToIdle: false)
+
+        if UIApplication.shared.applicationState == .active {
+            appendLog("🔄 检测到应用已经回到前台，正在立即恢复当前 AI 阶段...")
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                _ = await self.resumeInterruptedFetchIfNeeded()
+            }
+        }
+
+        return true
+    }
+
+    private func isRecoverableBackgroundInterruption(_ error: Error) -> Bool {
+        guard let urlError = error as? URLError else { return false }
+        switch urlError.code {
+        case .networkConnectionLost, .timedOut, .notConnectedToInternet, .cannotConnectToHost, .cannotFindHost:
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func startBackgroundProtectionIfNeeded() {
+        guard backgroundTaskID == .invalid else { return }
+        backgroundTaskID = UIApplication.shared.beginBackgroundTask(withName: "openchirp-ai-fetch") { [weak self] in
+            Task { @MainActor in
+                guard let self else { return }
+                self.appendLog("⏱️ 后台继续执行时间已用尽，若请求被中断，回到前台后会自动恢复。")
+                self.endBackgroundProtectionIfNeeded()
+            }
+        }
+    }
+
+    private func endBackgroundProtectionIfNeeded() {
+        guard backgroundTaskID != .invalid else { return }
+        UIApplication.shared.endBackgroundTask(backgroundTaskID)
+        backgroundTaskID = .invalid
+    }
+
+    private func finishFetch(clearRecoveryState: Bool = true, resetStageToIdle: Bool = true) {
+        isFetching = false
+        didEnterBackgroundDuringAIStage = false
+        endBackgroundProtectionIfNeeded()
+        if clearRecoveryState {
+            recoveryState = nil
+        }
+        if resetStageToIdle {
+            currentStage = .idle
+        }
+    }
+
     private func deleteOldNewsItems() {
         let fetchDescriptor = FetchDescriptor<NewsItem>()
         do {

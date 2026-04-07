@@ -4,6 +4,7 @@ import SwiftUI
 struct AgentLogPanel: View {
     let logs: [String]
     let isRunning: Bool
+    let fetchStage: FetchStage
 
     var body: some View {
         NavigationStack {
@@ -14,11 +15,11 @@ struct AgentLogPanel: View {
                     // 状态条
                     HStack {
                         Circle()
-                            .fill(isRunning ? Color.green : Color.gray)
+                            .fill(statusColor)
                             .frame(width: 8, height: 8)
-                        Text(isRunning ? "运行中..." : "已完成")
+                        Text(statusText)
                             .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(isRunning ? .green : .gray)
+                            .foregroundColor(statusColor)
                         Spacer()
                         Text("\(logs.count) 条日志")
                             .font(.system(.caption2, design: .monospaced))
@@ -62,6 +63,36 @@ struct AgentLogPanel: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbarColorScheme(.dark, for: .navigationBar)
             .toolbarBackground(Color.black, for: .navigationBar)
+        }
+    }
+
+    private var statusText: String {
+        switch fetchStage {
+        case .interrupted:
+            return "已中断，待恢复"
+        case .failed:
+            return "已失败"
+        case .idle:
+            return isRunning ? "运行中..." : "已完成"
+        case .fetchingRSS:
+            return "抓取 RSS 中..."
+        case .preselecting:
+            return "标题粗筛中..."
+        case .ranking:
+            return "精选重排中..."
+        }
+    }
+
+    private var statusColor: Color {
+        switch fetchStage {
+        case .interrupted:
+            return .orange
+        case .failed:
+            return .red
+        case .idle:
+            return isRunning ? .green : .gray
+        case .fetchingRSS, .preselecting, .ranking:
+            return .green
         }
     }
 }

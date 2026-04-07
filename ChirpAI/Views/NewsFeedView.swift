@@ -29,6 +29,7 @@ struct NewsFeedView: View {
 }
 
 struct NewsFeedContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject var viewModel: NewsFeedViewModel
     @State private var selectedNews: NewsItem?
     @State private var showLogPanel = false
@@ -136,7 +137,11 @@ struct NewsFeedContentView: View {
                 }
             }
             .sheet(isPresented: $showLogPanel) {
-                AgentLogPanel(logs: viewModel.logs, isRunning: viewModel.isFetching)
+                AgentLogPanel(
+                    logs: viewModel.logs,
+                    isRunning: viewModel.isFetching,
+                    fetchStage: viewModel.fetchStage
+                )
                     #if os(iOS)
                     .presentationDetents([.medium, .large])
                     .presentationDragIndicator(.visible)
@@ -173,6 +178,18 @@ struct NewsFeedContentView: View {
                 viewModel.loadNews()
                 Task {
                     await viewModel.retryPendingProfileUpdateIfNeeded()
+                }
+            }
+            .onChange(of: scenePhase) { _, newPhase in
+                switch newPhase {
+                case .background:
+                    viewModel.handleEnteredBackground()
+                case .active:
+                    Task {
+                        await viewModel.handleBecameActive()
+                    }
+                default:
+                    break
                 }
             }
             .alert("提取结果", isPresented: $viewModel.showAlert) {
