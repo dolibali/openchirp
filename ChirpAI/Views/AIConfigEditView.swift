@@ -14,9 +14,11 @@ struct AIConfigEditView: View {
     @State private var isTesting = false
     @State private var testMessage = ""
     @State private var showTestResult = false
+    @State private var showSaveError = false
+    @State private var saveErrorMessage = ""
 
     private var isEditing: Bool { existingProfile != nil }
-    private let glmService = GLMService()
+    private let diagnostics = AppDiagnosticsLogger.shared
 
     var body: some View {
         NavigationStack {
@@ -85,6 +87,11 @@ struct AIConfigEditView: View {
             } message: {
                 Text(testMessage)
             }
+            .alert("保存失败", isPresented: $showSaveError) {
+                Button("好的", role: .cancel) { }
+            } message: {
+                Text(saveErrorMessage)
+            }
             .onAppear {
                 if let p = existingProfile {
                     name = p.name
@@ -102,32 +109,47 @@ struct AIConfigEditView: View {
         profile.apiKey = apiKey
         profile.baseURL = baseURL
         profile.model = model
-        if isEditing {
-            manager.update(profile)
-        } else {
-            manager.add(profile)
+
+        do {
+            if isEditing {
+                try manager.update(profile)
+            } else {
+                try manager.add(profile)
+            }
+            dismiss()
+        } catch {
+            diagnostics.error(
+                domain: "ai_config",
+                message: "用户保存 AI 配置失败",
+                metadata: [
+                    "profile_name": profile.name,
+                    "error": error.localizedDescription
+                ]
+            )
+            saveErrorMessage = error.localizedDescription
+            showSaveError = true
         }
-        dismiss()
     }
 
     private func runTest() async {
         isTesting = true
-        // 临时用当前表单里的值覆盖 Manager，测完后还原
-        let oldActive = AIConfigManager.shared.activeProfile
-        let tempProfile = AIConfigProfile(name: "temp", apiKey: apiKey, baseURL: baseURL, model: model)
-        AIConfigManager.shared.add(tempProfile)
-        AIConfigManager.shared.activate(tempProfile)
+        defer { isTesting = false }
+
+        let testService = GLMService(
+            requestConfig: AIRequestConfig(
+                apiKey: apiKey,
+                baseURL: baseURL,
+                model: model
+            ),
+            shouldRecordDiagnostics: false
+        )
 
         do {
-            let ok = try await glmService.testConnection()
+            let ok = try await testService.testConnection()
             testMessage = ok ? "✅ 连接成功！AI 正常响应。" : "❌ 连接失败：未知错误"
         } catch {
             testMessage = "❌ 连接失败：\(error.localizedDescription)"
         }
-
-        AIConfigManager.shared.delete(tempProfile)
-        if let old = oldActive { AIConfigManager.shared.activate(old) }
-        isTesting = false
         showTestResult = true
     }
 }

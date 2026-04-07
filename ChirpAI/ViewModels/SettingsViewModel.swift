@@ -21,6 +21,7 @@ class SettingsViewModel: ObservableObject {
     private let modelContext: ModelContext
     private let preferenceManager: PreferenceManager
     private let glmService = GLMService()
+    private let diagnostics = AppDiagnosticsLogger.shared
 
     init(modelContext: ModelContext, preferenceManager: PreferenceManager) {
         self.modelContext = modelContext
@@ -32,7 +33,16 @@ class SettingsViewModel: ObservableObject {
             sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
         )
         descriptor.fetchLimit = 30
-        feedbacks = (try? modelContext.fetch(descriptor)) ?? []
+        do {
+            feedbacks = try modelContext.fetch(descriptor)
+        } catch {
+            diagnostics.error(
+                domain: "storage",
+                message: "设置页加载反馈记录失败",
+                metadata: ["error": error.localizedDescription]
+            )
+            feedbacks = []
+        }
 
         if let summary = preferenceManager.getCurrentProfileSummary() {
             profileSummary = summary
@@ -63,8 +73,8 @@ class SettingsViewModel: ObservableObject {
                     (action: fb.action, textFeedback: fb.textFeedback, newsTitle: fb.newsItem?.title ?? "", newsSummary: fb.newsItem?.summary ?? "")
                 }
             )
-            preferenceManager.saveProfile(summary: newSummary)
-            preferenceManager.markFeedbacksIncorporated(pendingFeedbacks)
+            try preferenceManager.saveProfile(summary: newSummary)
+            try preferenceManager.markFeedbacksIncorporated(pendingFeedbacks)
             preferenceManager.setNeedsProfileRefresh(false)
             profileSummary = newSummary
             refreshProfileSyncState()
@@ -73,6 +83,11 @@ class SettingsViewModel: ObservableObject {
                 message: "已根据待处理的反馈记录重新生成当前画像。"
             )
         } catch {
+            diagnostics.error(
+                domain: "profile",
+                message: "用户手动更新画像失败",
+                metadata: ["error": error.localizedDescription]
+            )
             preferenceManager.setNeedsProfileRefresh(true, failureMessage: error.localizedDescription)
             refreshProfileSyncState()
             presentStatusAlert(
@@ -101,8 +116,8 @@ class SettingsViewModel: ObservableObject {
                     (action: fb.action, textFeedback: fb.textFeedback, newsTitle: fb.newsItem?.title ?? "", newsSummary: fb.newsItem?.summary ?? "")
                 }
             )
-            preferenceManager.saveProfile(summary: newSummary)
-            preferenceManager.markFeedbacksIncorporated(allFeedbacks)
+            try preferenceManager.saveProfile(summary: newSummary)
+            try preferenceManager.markFeedbacksIncorporated(allFeedbacks)
             preferenceManager.setNeedsProfileRefresh(false)
             profileSummary = newSummary
             refreshProfileSyncState()
@@ -111,6 +126,11 @@ class SettingsViewModel: ObservableObject {
                 message: "已基于全部 \(allFeedbacks.count) 条历史反馈重建画像。"
             )
         } catch {
+            diagnostics.error(
+                domain: "profile",
+                message: "用户根据历史反馈重建画像失败",
+                metadata: ["error": error.localizedDescription]
+            )
             preferenceManager.setNeedsProfileRefresh(true, failureMessage: error.localizedDescription)
             refreshProfileSyncState()
             presentStatusAlert(
@@ -131,12 +151,17 @@ class SettingsViewModel: ObservableObject {
                 currentProfile: currentProfile,
                 userInstruction: text
             )
-            preferenceManager.saveProfile(summary: newSummary)
+            try preferenceManager.saveProfile(summary: newSummary)
             profileSummary = newSummary
             refreshProfileSyncState()
             isSubmittingDirectFeedback = false
             return true
         } catch {
+            diagnostics.error(
+                domain: "profile",
+                message: "用户手动调教画像失败",
+                metadata: ["error": error.localizedDescription]
+            )
             presentStatusAlert(
                 title: "调教失败",
                 message: "暂时无法应用这次直接调教。\n\n错误信息：\(error.localizedDescription)"
@@ -147,8 +172,15 @@ class SettingsViewModel: ObservableObject {
     }
 
     func deleteFeedback(_ feedback: Feedback) {
-        preferenceManager.deleteFeedback(feedback)
-        loadData()
+        do {
+            try preferenceManager.deleteFeedback(feedback)
+            loadData()
+        } catch {
+            presentStatusAlert(
+                title: "删除失败",
+                message: "暂时无法删除这条反馈。\n\n错误信息：\(error.localizedDescription)"
+            )
+        }
     }
 
     func updateAutoProfileRefreshThreshold(_ threshold: Int) {

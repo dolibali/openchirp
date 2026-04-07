@@ -34,6 +34,14 @@ class OnboardingViewModel: ObservableObject {
     func savePreferences() {
         let styleStr = selectedStyle != nil ? "，偏好的风格是：\(selectedStyle!)" : ""
         let summary = "用户初始兴趣：" + Array(selectedCategories).joined(separator: "、") + styleStr
-        preferenceManager.saveProfile(summary: summary)
+        do {
+            try preferenceManager.saveProfile(summary: summary)
+        } catch {
+            AppDiagnosticsLogger.shared.error(
+                domain: "profile",
+                message: "Onboarding 保存初始画像失败",
+                metadata: ["error": error.localizedDescription]
+            )
+        }
     }
 }

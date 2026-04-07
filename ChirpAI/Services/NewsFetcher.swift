@@ -59,10 +59,15 @@ class NewsFetcher: ObservableObject {
     private let preferenceManager: PreferenceManager
     private let glmService = GLMService()
     private let rssParser = RSSParser()
+    private let diagnostics = AppDiagnosticsLogger.shared
+    private let session: URLSession
 
     init(modelContext: ModelContext, preferenceManager: PreferenceManager) {
         self.modelContext = modelContext
         self.preferenceManager = preferenceManager
+        let configuration = URLSessionConfiguration.default
+        configuration.waitsForConnectivity = true
+        self.session = URLSession(configuration: configuration)
     }
 
     func fetchNextNews() async {
@@ -89,7 +94,8 @@ class NewsFetcher: ObservableObject {
             appendLog("🗓️ 抓取策略：只扫描最近 \(lookbackDays) 天的文章")
 
             for source in sources {
-                if let items = try? await fetchRSSItems(from: source) {
+                do {
+                    let items = try await fetchRSSItems(from: source)
                     var added = 0
                     var skippedOld = 0
                     for item in items {
@@ -117,7 +123,16 @@ class NewsFetcher: ObservableObject {
                     } else {
                         appendLog("➤ 扫描 [\(source.name)]: 发现 \(added) 篇候选")
                     }
-                } else {
+                } catch {
+                    diagnostics.error(
+                        domain: "network",
+                        message: "RSS 源抓取失败",
+                        metadata: [
+                            "source_name": source.name,
+                            "source_url": source.url,
+                            "error": error.localizedDescription
+                        ]
+                    )
                     appendLog("➤ 扫描 [\(source.name)]: 连接超时或被拒绝，跳过")
                 }
             }
@@ -192,6 +207,18 @@ class NewsFetcher: ObservableObject {
 
                 appendLog("🎉 精选成功：[\(selected.source)] \(selected.title)")
             }
+
+            do {
+                try modelContext.save()
+            } catch {
+                diagnostics.error(
+                    domain: "storage",
+                    message: "保存精选新闻失败",
+                    metadata: ["error": error.localizedDescription]
+                )
+                throw error
+            }
+
             // 完成汇总
             let count = pickResults.filter { $0.index >= 0 && $0.index < filteredCandidates.count }.count
             appendLog("✅ 完成！本次为您精选了 \(count) 篇推文")
@@ -210,7 +237,19 @@ class NewsFetcher: ObservableObject {
         request.timeoutInterval = 3
         request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
 
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response): (Data, URLResponse) = try await RetryExecutor.execute(
+            stage: "rss_fetch",
+            url: url
+        ) { [self, request] in
+            let (data, response) = try await self.session.data(for: request)
+            if let httpResponse = response as? HTTPURLResponse,
+               (500...599).contains(httpResponse.statusCode) {
+                let rawError = String(data: data, encoding: .utf8) ?? "无法解析的非UTF8数据"
+                throw RetryableRequestError.httpStatus(code: httpResponse.statusCode, body: rawError)
+            }
+            return (data, response)
+        }
+
         guard let httpResponse = response as? HTTPURLResponse,
               (200...299).contains(httpResponse.statusCode) else {
             return []
@@ -224,7 +263,8 @@ class NewsFetcher: ObservableObject {
     
     private func deleteOldNewsItems() {
         let fetchDescriptor = FetchDescriptor<NewsItem>()
-        if let items = try? modelContext.fetch(fetchDescriptor) {
+        do {
+            let items = try modelContext.fetch(fetchDescriptor)
             let thresholdDate = Date().addingTimeInterval(-7 * 24 * 3600)
             var deletedCount = 0
             for item in items {
@@ -234,8 +274,19 @@ class NewsFetcher: ObservableObject {
                 }
             }
             if deletedCount > 0 {
-                print("Deleted \(deletedCount) old news items.")
+                try modelContext.save()
+                diagnostics.info(
+                    domain: "storage",
+                    message: "已清理过期新闻缓存",
+                    metadata: ["deleted_count": "\(deletedCount)"]
+                )
             }
+        } catch {
+            diagnostics.error(
+                domain: "storage",
+                message: "清理旧新闻缓存失败",
+                metadata: ["error": error.localizedDescription]
+            )
         }
     }
 }

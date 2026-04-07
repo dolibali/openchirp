@@ -24,6 +24,7 @@ class NewsFeedViewModel: ObservableObject {
     private let newsFetcher: NewsFetcher
     private var cancellables = Set<AnyCancellable>()
     private var isUpdatingProfile = false
+    private let diagnostics = AppDiagnosticsLogger.shared
 
     init(modelContext: ModelContext, preferenceManager: PreferenceManager) {
         self.modelContext = modelContext
@@ -50,7 +51,16 @@ class NewsFeedViewModel: ObservableObject {
         let descriptor = FetchDescriptor<NewsItem>(
             sortBy: [SortDescriptor(\.fetchedAt, order: .reverse)]
         )
-        newsItems = (try? modelContext.fetch(descriptor)) ?? []
+        do {
+            newsItems = try modelContext.fetch(descriptor)
+        } catch {
+            diagnostics.error(
+                domain: "storage",
+                message: "加载新闻列表失败",
+                metadata: ["error": error.localizedDescription]
+            )
+            newsItems = []
+        }
     }
 
     func fetchNext() async {
@@ -74,7 +84,17 @@ class NewsFeedViewModel: ObservableObject {
             newsItems.remove(at: idx)
         }
         modelContext.delete(news)
-        try? modelContext.save()
+        do {
+            try modelContext.save()
+        } catch {
+            diagnostics.error(
+                domain: "storage",
+                message: "删除新闻失败",
+                metadata: ["error": error.localizedDescription]
+            )
+            alertMessage = "删除失败：\(error.localizedDescription)"
+            showAlert = true
+        }
     }
 
     func toggleFeedback(for news: NewsItem, action: FeedbackAction) async {
@@ -82,14 +102,37 @@ class NewsFeedViewModel: ObservableObject {
         let fetchDescriptor = FetchDescriptor<Feedback>(
             predicate: #Predicate { $0.newsItem?.id == targetId }
         )
-        let existingFeedbacks = (try? modelContext.fetch(fetchDescriptor)) ?? []
+        let existingFeedbacks: [Feedback]
+        do {
+            existingFeedbacks = try modelContext.fetch(fetchDescriptor)
+        } catch {
+            diagnostics.error(
+                domain: "storage",
+                message: "读取反馈状态失败",
+                metadata: ["error": error.localizedDescription]
+            )
+            alertMessage = "反馈失败：\(error.localizedDescription)"
+            showAlert = true
+            return
+        }
         let alreadyHasThisAction = existingFeedbacks.contains { $0.action == action.rawValue }
         
         // Remove existing feedbacks for this news (to ensure exclusive choice or handle cancellation)
         for old in existingFeedbacks {
             modelContext.delete(old)
         }
-        try? modelContext.save()
+        do {
+            try modelContext.save()
+        } catch {
+            diagnostics.error(
+                domain: "storage",
+                message: "清理旧反馈失败",
+                metadata: ["error": error.localizedDescription]
+            )
+            alertMessage = "反馈失败：\(error.localizedDescription)"
+            showAlert = true
+            return
+        }
         
         if alreadyHasThisAction {
             // Un-toggled successfully
@@ -103,7 +146,18 @@ class NewsFeedViewModel: ObservableObject {
             newsItem: news
         )
         modelContext.insert(feedback)
-        try? modelContext.save()
+        do {
+            try modelContext.save()
+        } catch {
+            diagnostics.error(
+                domain: "storage",
+                message: "保存反馈失败",
+                metadata: ["error": error.localizedDescription]
+            )
+            alertMessage = "反馈失败：\(error.localizedDescription)"
+            showAlert = true
+            return
+        }
         
         await checkAndRunProfileUpdate()
         loadNews()
@@ -115,7 +169,19 @@ class NewsFeedViewModel: ObservableObject {
         let fetchDescriptor = FetchDescriptor<Feedback>(
             predicate: #Predicate { $0.newsItem?.id == targetId }
         )
-        let existingFeedbacks = (try? modelContext.fetch(fetchDescriptor)) ?? []
+        let existingFeedbacks: [Feedback]
+        do {
+            existingFeedbacks = try modelContext.fetch(fetchDescriptor)
+        } catch {
+            diagnostics.error(
+                domain: "storage",
+                message: "读取反馈状态失败",
+                metadata: ["error": error.localizedDescription]
+            )
+            alertMessage = "反馈失败：\(error.localizedDescription)"
+            showAlert = true
+            return
+        }
         for old in existingFeedbacks {
             modelContext.delete(old)
         }
@@ -126,7 +192,18 @@ class NewsFeedViewModel: ObservableObject {
             newsItem: news
         )
         modelContext.insert(feedback)
-        try? modelContext.save()
+        do {
+            try modelContext.save()
+        } catch {
+            diagnostics.error(
+                domain: "storage",
+                message: "保存文字反馈失败",
+                metadata: ["error": error.localizedDescription]
+            )
+            alertMessage = "反馈失败：\(error.localizedDescription)"
+            showAlert = true
+            return
+        }
 
         await checkAndRunProfileUpdate()
         loadNews()
@@ -174,12 +251,16 @@ class NewsFeedViewModel: ObservableObject {
                     (action: fb.action, textFeedback: fb.textFeedback, newsTitle: fb.newsItem?.title ?? "", newsSummary: fb.newsItem?.summary ?? "")
                 }
             )
-            preferenceManager.saveProfile(summary: newSummary)
-            preferenceManager.markFeedbacksIncorporated(feedbacks)
+            try preferenceManager.saveProfile(summary: newSummary)
+            try preferenceManager.markFeedbacksIncorporated(feedbacks)
             preferenceManager.setNeedsProfileRefresh(false)
         } catch {
             let message = error.localizedDescription
-            print("AI 画像自动更新失败: \(message)")
+            diagnostics.error(
+                domain: "profile",
+                message: "AI 自动更新画像失败",
+                metadata: ["error": message]
+            )
             preferenceManager.setNeedsProfileRefresh(true, failureMessage: message)
 
             if showFailureAlert {

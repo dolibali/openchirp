@@ -135,6 +135,14 @@ struct OnboardingView: View {
         }
         let summary = "用户初始兴趣：" + parts.joined(separator: "、")
         let pm = PreferenceManager(modelContext: modelContext)
-        pm.saveProfile(summary: summary)
+        do {
+            try pm.saveProfile(summary: summary)
+        } catch {
+            AppDiagnosticsLogger.shared.error(
+                domain: "profile",
+                message: "Onboarding 页面保存初始画像失败",
+                metadata: ["error": error.localizedDescription]
+            )
+        }
     }
 }

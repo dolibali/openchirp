@@ -4,6 +4,7 @@ import SwiftData
 @MainActor
 class PreferenceManager {
     private let modelContext: ModelContext
+    private let diagnostics = AppDiagnosticsLogger.shared
     private let needsProfileRefreshKey = "needs_profile_refresh"
     private let profileRefreshFailureMessageKey = "profile_refresh_failure_message"
     private let autoProfileRefreshThresholdKey = "auto_profile_refresh_threshold"
@@ -21,24 +22,51 @@ class PreferenceManager {
             sortBy: [SortDescriptor(\.generatedAt, order: .reverse)]
         )
         descriptor.fetchLimit = 1
-        return (try? modelContext.fetch(descriptor))?.first?.summary
-    }
-
-    func saveProfile(summary: String) {
-        let descriptor = FetchDescriptor<UserProfile>()
-        let existing = (try? modelContext.fetch(descriptor)) ?? []
-        for old in existing {
-            modelContext.delete(old)
+        do {
+            return try modelContext.fetch(descriptor).first?.summary
+        } catch {
+            diagnostics.error(
+                domain: "storage",
+                message: "读取当前画像失败",
+                metadata: ["error": error.localizedDescription]
+            )
+            return nil
         }
-
-        let newProfile = UserProfile(summary: summary)
-        modelContext.insert(newProfile)
-        try? modelContext.save()
     }
 
-    func deleteFeedback(_ feedback: Feedback) {
-        modelContext.delete(feedback)
-        try? modelContext.save()
+    func saveProfile(summary: String) throws {
+        let descriptor = FetchDescriptor<UserProfile>()
+        do {
+            let existing = try modelContext.fetch(descriptor)
+            for old in existing {
+                modelContext.delete(old)
+            }
+
+            let newProfile = UserProfile(summary: summary)
+            modelContext.insert(newProfile)
+            try modelContext.save()
+        } catch {
+            diagnostics.error(
+                domain: "profile",
+                message: "保存画像失败",
+                metadata: ["error": error.localizedDescription]
+            )
+            throw error
+        }
+    }
+
+    func deleteFeedback(_ feedback: Feedback) throws {
+        do {
+            modelContext.delete(feedback)
+            try modelContext.save()
+        } catch {
+            diagnostics.error(
+                domain: "storage",
+                message: "删除反馈失败",
+                metadata: ["error": error.localizedDescription]
+            )
+            throw error
+        }
 
         if getPendingFeedbackCount() == 0 {
             setNeedsProfileRefresh(false)
@@ -50,24 +78,58 @@ class PreferenceManager {
         let descriptor = FetchDescriptor<SeenNews>(
             predicate: #Predicate { $0.expireAt < now }
         )
-        let expired = (try? modelContext.fetch(descriptor)) ?? []
-        for item in expired {
-            modelContext.delete(item)
+        do {
+            let expired = try modelContext.fetch(descriptor)
+            for item in expired {
+                modelContext.delete(item)
+            }
+            if !expired.isEmpty {
+                try modelContext.save()
+            }
+        } catch {
+            diagnostics.error(
+                domain: "storage",
+                message: "清理过期已读记录失败",
+                metadata: ["error": error.localizedDescription]
+            )
         }
-        try? modelContext.save()
     }
 
     func isNewsSeen(urlHash: String) -> Bool {
         let descriptor = FetchDescriptor<SeenNews>(
             predicate: #Predicate { $0.urlHash == urlHash }
         )
-        return ((try? modelContext.fetchCount(descriptor)) ?? 0) > 0
+        do {
+            return try modelContext.fetchCount(descriptor) > 0
+        } catch {
+            diagnostics.error(
+                domain: "storage",
+                message: "查询已读记录失败",
+                metadata: [
+                    "url_hash": urlHash,
+                    "error": error.localizedDescription
+                ]
+            )
+            return false
+        }
     }
 
     func markNewsSeen(urlHash: String, title: String) {
-        let seen = SeenNews(urlHash: urlHash, title: title)
-        modelContext.insert(seen)
-        try? modelContext.save()
+        do {
+            let seen = SeenNews(urlHash: urlHash, title: title)
+            modelContext.insert(seen)
+            try modelContext.save()
+        } catch {
+            diagnostics.error(
+                domain: "storage",
+                message: "写入已读记录失败",
+                metadata: [
+                    "url_hash": urlHash,
+                    "title": title,
+                    "error": error.localizedDescription
+                ]
+            )
+        }
     }
 
     func getSeenTitles(limit: Int = 50) -> [String] {
@@ -75,7 +137,16 @@ class PreferenceManager {
             sortBy: [SortDescriptor(\.seenAt, order: .reverse)]
         )
         descriptor.fetchLimit = limit
-        return (try? modelContext.fetch(descriptor))?.map { $0.title } ?? []
+        do {
+            return try modelContext.fetch(descriptor).map { $0.title }
+        } catch {
+            diagnostics.error(
+                domain: "storage",
+                message: "读取已看标题失败",
+                metadata: ["error": error.localizedDescription]
+            )
+            return []
+        }
     }
 
     func getRecentFeedbacks(limit: Int = 30) -> [Feedback] {
@@ -83,40 +154,94 @@ class PreferenceManager {
             sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
         )
         descriptor.fetchLimit = limit
-        return (try? modelContext.fetch(descriptor)) ?? []
+        do {
+            return try modelContext.fetch(descriptor)
+        } catch {
+            diagnostics.error(
+                domain: "storage",
+                message: "读取最近反馈失败",
+                metadata: ["error": error.localizedDescription]
+            )
+            return []
+        }
     }
 
     func getAllFeedbacksChronological() -> [Feedback] {
         let descriptor = FetchDescriptor<Feedback>(
             sortBy: [SortDescriptor(\.createdAt, order: .forward)]
         )
-        return (try? modelContext.fetch(descriptor)) ?? []
+        do {
+            return try modelContext.fetch(descriptor)
+        } catch {
+            diagnostics.error(
+                domain: "storage",
+                message: "读取历史反馈失败",
+                metadata: ["error": error.localizedDescription]
+            )
+            return []
+        }
     }
 
     func getFeedbackCount() -> Int {
         let descriptor = FetchDescriptor<Feedback>()
-        return (try? modelContext.fetchCount(descriptor)) ?? 0
+        do {
+            return try modelContext.fetchCount(descriptor)
+        } catch {
+            diagnostics.error(
+                domain: "storage",
+                message: "统计反馈数失败",
+                metadata: ["error": error.localizedDescription]
+            )
+            return 0
+        }
     }
 
     func getPendingFeedbacks(limit: Int = 30) -> [Feedback] {
         let descriptor = FetchDescriptor<Feedback>(
             sortBy: [SortDescriptor(\.createdAt, order: .reverse)]
         )
-        let allFeedbacks = (try? modelContext.fetch(descriptor)) ?? []
-        return Array(allFeedbacks.filter { $0.profileIncorporatedAt == nil }.prefix(limit))
+        do {
+            let allFeedbacks = try modelContext.fetch(descriptor)
+            return Array(allFeedbacks.filter { $0.profileIncorporatedAt == nil }.prefix(limit))
+        } catch {
+            diagnostics.error(
+                domain: "storage",
+                message: "读取待处理反馈失败",
+                metadata: ["error": error.localizedDescription]
+            )
+            return []
+        }
     }
 
     func getPendingFeedbackCount() -> Int {
         let descriptor = FetchDescriptor<Feedback>()
-        let allFeedbacks = (try? modelContext.fetch(descriptor)) ?? []
-        return allFeedbacks.filter { $0.profileIncorporatedAt == nil }.count
+        do {
+            let allFeedbacks = try modelContext.fetch(descriptor)
+            return allFeedbacks.filter { $0.profileIncorporatedAt == nil }.count
+        } catch {
+            diagnostics.error(
+                domain: "storage",
+                message: "统计待处理反馈失败",
+                metadata: ["error": error.localizedDescription]
+            )
+            return 0
+        }
     }
 
-    func markFeedbacksIncorporated(_ feedbacks: [Feedback], at date: Date = Date()) {
-        for feedback in feedbacks {
-            feedback.profileIncorporatedAt = date
+    func markFeedbacksIncorporated(_ feedbacks: [Feedback], at date: Date = Date()) throws {
+        do {
+            for feedback in feedbacks {
+                feedback.profileIncorporatedAt = date
+            }
+            try modelContext.save()
+        } catch {
+            diagnostics.error(
+                domain: "profile",
+                message: "标记反馈已纳入画像失败",
+                metadata: ["error": error.localizedDescription]
+            )
+            throw error
         }
-        try? modelContext.save()
     }
 
     func setNeedsProfileRefresh(_ needsRefresh: Bool, failureMessage: String? = nil) {

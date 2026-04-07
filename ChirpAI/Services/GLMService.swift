@@ -1,64 +1,170 @@
 import Foundation
 
 struct GLMConfig {
+    static let defaultBaseURL = "https://open.bigmodel.cn/api/coding/paas/v4"
+    static let defaultModel = "GLM-4.7-FlashX"
+
+    static var current: AIRequestConfig {
+        AIConfigManager.shared.activeRequestConfig ?? AIRequestConfig(
+            apiKey: "",
+            baseURL: defaultBaseURL,
+            model: defaultModel
+        )
+    }
+
     static var apiKey: String {
-        AIConfigManager.shared.activeProfile?.apiKey ?? ""
+        current.apiKey
     }
     static var baseURL: String {
-        AIConfigManager.shared.activeProfile?.baseURL ?? "https://open.bigmodel.cn/api/coding/paas/v4"
+        current.baseURL
     }
     static var model: String {
-        AIConfigManager.shared.activeProfile?.model ?? "GLM-4.7-FlashX"
+        current.model
     }
 }
 
 class GLMService {
-    private let session = URLSession.shared
+    private let session: URLSession
+    private let requestConfigOverride: AIRequestConfig?
+    private let diagnostics = AppDiagnosticsLogger.shared
+    private let shouldRecordDiagnostics: Bool
+
+    init(requestConfig: AIRequestConfig? = nil, shouldRecordDiagnostics: Bool = true) {
+        self.requestConfigOverride = requestConfig
+        self.shouldRecordDiagnostics = shouldRecordDiagnostics
+        let configuration = URLSessionConfiguration.default
+        configuration.waitsForConnectivity = true
+        self.session = URLSession(configuration: configuration)
+    }
+
+    private var requestConfig: AIRequestConfig {
+        requestConfigOverride ?? GLMConfig.current
+    }
+
     private func callAPI(
         systemPrompt: String,
         userMessage: String,
         tools: [[String: Any]]? = nil
     ) async throws -> [String: Any] {
+        let config = requestConfig
+        let apiKey = config.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !apiKey.isEmpty else {
+            throw GLMError.missingAPIKey
+        }
+
         let messages: [[String: String]] = [
             ["role": "system", "content": SystemPrompts.base + "\n\n" + systemPrompt],
             ["role": "user", "content": userMessage]
         ]
 
         var body: [String: Any] = [
-            "model": GLMConfig.model,
+            "model": config.model,
             "messages": messages
         ]
         if let tools { body["tools"] = tools }
 
-        let rawURL = GLMConfig.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let rawURL = config.baseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let fullURL = rawURL.hasSuffix("/chat/completions") ? rawURL : rawURL + "/chat/completions"
+        guard let url = URL(string: fullURL) else {
+            throw GLMError.invalidConfiguration(detail: "Base URL 无效：\(config.baseURL)")
+        }
 
-        var request = URLRequest(url: URL(string: fullURL)!)
+        var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(GLMConfig.apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         // 两阶段漏斗各需约 30-40s，总超时设 300s 保证复杂场景不超时
         request.timeoutInterval = 300
 
-        let (data, response) = try await session.data(for: request)
+        let (data, httpResponse): (Data, HTTPURLResponse) = try await RetryExecutor.execute(
+            stage: "glm_call_api",
+            url: url
+            ,
+            logger: shouldRecordDiagnostics ? diagnostics : nil
+        ) { [self, request] in
+            let (data, response) = try await self.session.data(for: request)
 
-        guard let httpResponse = response as? HTTPURLResponse else {
-            throw GLMError.invalidResponse(detail: "无 HTTP Response")
+            guard let httpResponse = response as? HTTPURLResponse else {
+                throw GLMError.invalidResponse(detail: "无 HTTP Response")
+            }
+
+            if (500...599).contains(httpResponse.statusCode) {
+                let rawError = String(data: data, encoding: .utf8) ?? "无法解析的非UTF8数据"
+                throw RetryableRequestError.httpStatus(code: httpResponse.statusCode, body: rawError)
+            }
+
+            return (data, httpResponse)
         }
+
         if !(200...299).contains(httpResponse.statusCode) {
             let rawError = String(data: data, encoding: .utf8) ?? "无法解析的非UTF8数据"
-            print("GLM ERROR RAW RESPONSE: \(rawError)")
-            
-            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-               let error = json["error"] as? [String: Any],
-               let msg = error["message"] as? String {
-                throw GLMError.apiError(statusCode: httpResponse.statusCode, message: "\(msg) \n(裸数据: \(rawError))")
+            if shouldRecordDiagnostics {
+                diagnostics.error(
+                    domain: "model",
+                    message: "模型接口返回非成功状态码",
+                    metadata: [
+                        "status_code": "\(httpResponse.statusCode)",
+                        "model": config.model,
+                        "url": fullURL
+                    ]
+                )
             }
+
+            do {
+                if let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                   let error = json["error"] as? [String: Any],
+                   let msg = error["message"] as? String {
+                    throw GLMError.apiError(statusCode: httpResponse.statusCode, message: "\(msg) \n(裸数据: \(rawError))")
+                }
+            } catch let error as GLMError {
+                throw error
+            } catch {
+                if shouldRecordDiagnostics {
+                    diagnostics.warning(
+                        domain: "model",
+                        message: "解析模型错误响应失败",
+                        metadata: [
+                            "status_code": "\(httpResponse.statusCode)",
+                            "error": error.localizedDescription
+                        ]
+                    )
+                }
+            }
+
             throw GLMError.apiError(statusCode: httpResponse.statusCode, message: "HTTP \(httpResponse.statusCode)\n(裸数据: \(rawError))")
         }
 
-        guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        let json: [String: Any]
+        do {
+            guard let parsed = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+                let rawData = String(data: data, encoding: .utf8) ?? ""
+                throw GLMError.invalidResponse(detail: "JSON解析失败，裸数据：\(rawData)")
+            }
+            json = parsed
+        } catch let error as GLMError {
+            if shouldRecordDiagnostics {
+                diagnostics.error(
+                    domain: "model",
+                    message: "模型响应 JSON 解析失败",
+                    metadata: [
+                        "model": config.model,
+                        "error": error.localizedDescription
+                    ]
+                )
+            }
+            throw error
+        } catch {
+            if shouldRecordDiagnostics {
+                diagnostics.error(
+                    domain: "model",
+                    message: "模型响应 JSON 解析异常",
+                    metadata: [
+                        "model": config.model,
+                        "error": error.localizedDescription
+                    ]
+                )
+            }
             let rawData = String(data: data, encoding: .utf8) ?? ""
             throw GLMError.invalidResponse(detail: "JSON解析失败，裸数据：\(rawData)")
         }
@@ -75,14 +181,50 @@ class GLMService {
         guard let toolCalls = response["tool_calls"] as? [[String: Any]],
               let firstCall = toolCalls.first,
               let function = firstCall["function"] as? [String: Any],
+              let functionName = function["name"] as? String,
+              functionName == toolName,
               let argsStr = function["arguments"] as? String else {
             throw GLMError.noToolCall
         }
-        guard let argsData = argsStr.data(using: .utf8),
-              let args = try? JSONSerialization.jsonObject(with: argsData) as? [String: Any] else {
+
+        guard let argsData = argsStr.data(using: .utf8) else {
+            if shouldRecordDiagnostics {
+                diagnostics.error(
+                    domain: "model",
+                    message: "工具调用参数无法转为 UTF-8",
+                    metadata: ["tool": toolName]
+                )
+            }
             throw GLMError.invalidToolArgs
         }
-        return args
+
+        do {
+            guard let args = try JSONSerialization.jsonObject(with: argsData) as? [String: Any] else {
+                throw GLMError.invalidToolArgs
+            }
+            return args
+        } catch let error as GLMError {
+            if shouldRecordDiagnostics {
+                diagnostics.error(
+                    domain: "model",
+                    message: "工具调用参数结构异常",
+                    metadata: ["tool": toolName]
+                )
+            }
+            throw error
+        } catch {
+            if shouldRecordDiagnostics {
+                diagnostics.error(
+                    domain: "model",
+                    message: "工具调用参数 JSON 解析失败",
+                    metadata: [
+                        "tool": toolName,
+                        "error": error.localizedDescription
+                    ]
+                )
+            }
+            throw GLMError.invalidToolArgs
+        }
     }
 
     func updateProfile(
@@ -419,12 +561,14 @@ class GLMService {
             }
             return true
         } catch GLMError.noToolCall {
-            throw GLMError.functionCallingUnsupported(modelName: GLMConfig.model)
+            throw GLMError.functionCallingUnsupported(modelName: requestConfig.model)
         }
     }
 }
 
 enum GLMError: LocalizedError {
+    case missingAPIKey
+    case invalidConfiguration(detail: String)
     case invalidResponse(detail: String)
     case noToolCall
     case invalidToolArgs
@@ -433,6 +577,8 @@ enum GLMError: LocalizedError {
 
     var errorDescription: String? {
         switch self {
+        case .missingAPIKey: return "当前 AI 配置未填写 API Key"
+        case .invalidConfiguration(let detail): return "AI 配置无效：\(detail)"
         case .invalidResponse(let info): return "API 返回格式异常: \(info)"
         case .noToolCall: return "模型未调用预期的工具，请检查模型是否支持 Function Calling"
         case .invalidToolArgs: return "模型返回的工具参数格式异常"

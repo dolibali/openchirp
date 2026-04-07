@@ -5,6 +5,10 @@ import SwiftData
 struct ChirpAIApp: App {
     @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
 
+    init() {
+        AppDiagnosticsLogger.shared.prune()
+    }
+
     var body: some Scene {
         WindowGroup {
             if hasCompletedOnboarding {

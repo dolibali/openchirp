@@ -1,6 +1,7 @@
 import SwiftUI
 import SwiftData
 import UserNotifications
+import UIKit
 
 struct SettingsView: View {
     @Environment(\.modelContext) private var modelContext
@@ -24,9 +25,27 @@ struct SettingsView: View {
 
 struct SettingsContentView: View {
     @StateObject var viewModel: SettingsViewModel
+    @ObservedObject private var aiConfigManager = AIConfigManager.shared
 
     var body: some View {
         List {
+            if let warningMessage = aiConfigManager.migrationWarningMessage {
+                Section("配置提醒") {
+                    NavigationLink(destination: AISettingsView()) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text("AI 配置需要重新保存")
+                                .font(.subheadline)
+                                .foregroundColor(.red)
+                            Text(warningMessage)
+                                .font(.footnote)
+                                .foregroundColor(.secondary)
+                                .lineLimit(3)
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+            }
+
             if viewModel.needsProfileRefresh || viewModel.pendingFeedbackCount > 0 {
                 Section(viewModel.needsProfileRefresh ? "画像待处理" : "画像同步") {
                     NavigationLink(destination: ProfileSettingsView(viewModel: viewModel)) {
@@ -82,9 +101,16 @@ struct SettingsContentView: View {
                     Label("AI 配置", systemImage: "cpu")
                 }
             }
+
+            Section("开发者选项") {
+                NavigationLink(destination: DeveloperOptionsView()) {
+                    Label("诊断与日志", systemImage: "wrench.and.screwdriver")
+                }
+            }
         }
         .navigationTitle("设置")
         .onAppear {
+            AppDiagnosticsLogger.shared.prune()
             viewModel.loadData()
         }
     }
@@ -366,12 +392,31 @@ struct AISettingsView: View {
     @ObservedObject private var manager = AIConfigManager.shared
     @State private var showAddSheet = false
     @State private var editingProfile: AIConfigProfile? = nil
+    @State private var showActionError = false
+    @State private var actionErrorMessage = ""
 
     var body: some View {
         List {
+            if let warningMessage = manager.migrationWarningMessage {
+                Section("迁移提醒") {
+                    Text(warningMessage)
+                        .font(.footnote)
+                        .foregroundColor(.secondary)
+
+                    Button("我知道了") {
+                        manager.dismissMigrationWarning()
+                    }
+                }
+            }
+
             ForEach(manager.profiles) { profile in
                 Button {
-                    manager.activate(profile)
+                    do {
+                        try manager.activate(profile)
+                    } catch {
+                        actionErrorMessage = error.localizedDescription
+                        showActionError = true
+                    }
                 } label: {
                     HStack {
                         VStack(alignment: .leading, spacing: 3) {
@@ -390,7 +435,7 @@ struct AISettingsView: View {
                                 .foregroundColor(.secondary)
                         }
                         Spacer()
-                        if profile.apiKey.isEmpty {
+                        if !manager.hasAPIKey(profile) {
                             Text("未配置 Key")
                                 .font(.caption2)
                                 .foregroundColor(.orange)
@@ -399,7 +444,12 @@ struct AISettingsView: View {
                 }
                 .swipeActions(edge: .trailing, allowsFullSwipe: true) {
                     Button(role: .destructive) {
-                        manager.delete(profile)
+                        do {
+                            try manager.delete(profile)
+                        } catch {
+                            actionErrorMessage = error.localizedDescription
+                            showActionError = true
+                        }
                     } label: {
                         Label("删除", systemImage: "trash")
                     }
@@ -430,7 +480,211 @@ struct AISettingsView: View {
         .sheet(item: $editingProfile) { profile in
             AIConfigEditView(existingProfile: profile)
         }
+        .alert("AI 配置", isPresented: $showActionError) {
+            Button("好的", role: .cancel) { }
+        } message: {
+            Text(actionErrorMessage)
+        }
     }
+}
+
+struct DeveloperOptionsView: View {
+    var body: some View {
+        List {
+            NavigationLink(destination: DiagnosticsLogView()) {
+                Label("诊断日志", systemImage: "doc.text.magnifyingglass")
+            }
+        }
+        .navigationTitle("开发者选项")
+        .onAppear {
+            AppDiagnosticsLogger.shared.prune()
+        }
+    }
+}
+
+struct DiagnosticsLogView: View {
+    @State private var entries: [DiagnosticLogEntry] = []
+    @State private var showShareSheet = false
+    @State private var shareItems: [Any] = []
+    @State private var showCopyAlert = false
+    @State private var copyAlertMessage = ""
+    @State private var showExportError = false
+    @State private var exportErrorMessage = ""
+
+    var body: some View {
+        List {
+            Section {
+                if entries.isEmpty {
+                    Text("最近 7 天暂无诊断日志")
+                        .foregroundColor(.secondary)
+                } else {
+                    ForEach(entries) { entry in
+                        VStack(alignment: .leading, spacing: 8) {
+                            HStack(spacing: 8) {
+                                Text(levelTitle(entry.level))
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundColor(levelColor(entry.level))
+                                Text(entry.domain)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                Text(entry.createdAt.formatted(date: .abbreviated, time: .shortened))
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                            Text(entry.message)
+                                .font(.subheadline)
+                                .foregroundColor(.primary)
+                            if !entry.metadata.isEmpty {
+                                Text(entry.metadata
+                                    .sorted { $0.key < $1.key }
+                                    .map { "\($0.key): \($0.value)" }
+                                    .joined(separator: " · "))
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                        .contextMenu {
+                            Button("复制") {
+                                UIPasteboard.general.string = formattedEntry(entry)
+                                copyAlertMessage = "该条日志已复制。"
+                                showCopyAlert = true
+                            }
+                        }
+                    }
+                }
+            } header: {
+                Text("最近 7 天")
+            } footer: {
+                Text("日志仅保留最近 7 天，且最多保留 500 条。")
+            }
+
+            Section {
+                Button("清空日志", role: .destructive) {
+                    AppDiagnosticsLogger.shared.clear()
+                    refreshLogs()
+                }
+            }
+        }
+        .navigationTitle("诊断日志")
+        .toolbar {
+            ToolbarItemGroup(placement: .topBarTrailing) {
+                Button("复制全部") {
+                    UIPasteboard.general.string = formattedEntriesText(entries)
+                    copyAlertMessage = entries.isEmpty ? "当前没有可复制的日志。" : "诊断日志已复制。"
+                    showCopyAlert = true
+                }
+                .disabled(entries.isEmpty)
+
+                Button("导出") {
+                    exportLogs()
+                }
+                .disabled(entries.isEmpty)
+            }
+        }
+        .onAppear {
+            refreshLogs()
+        }
+        .sheet(isPresented: $showShareSheet) {
+            ActivityView(activityItems: shareItems)
+        }
+        .alert("已复制", isPresented: $showCopyAlert) {
+            Button("好的", role: .cancel) { }
+        } message: {
+            Text(copyAlertMessage)
+        }
+        .alert("导出失败", isPresented: $showExportError) {
+            Button("好的", role: .cancel) { }
+        } message: {
+            Text(exportErrorMessage)
+        }
+    }
+
+    private func refreshLogs() {
+        AppDiagnosticsLogger.shared.prune()
+        entries = AppDiagnosticsLogger.shared.entries()
+    }
+
+    private func exportLogs() {
+        do {
+            let fileURL = try createExportFile()
+            shareItems = [fileURL]
+            showShareSheet = true
+        } catch {
+            exportErrorMessage = error.localizedDescription
+            showExportError = true
+        }
+    }
+
+    private func createExportFile() throws -> URL {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        let timestamp = formatter.string(from: Date()).replacingOccurrences(of: ":", with: "-")
+        let fileName = "openchirp-diagnostics-\(timestamp).txt"
+        let fileURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+        let content = formattedEntriesText(entries)
+        guard let data = content.data(using: .utf8) else {
+            throw NSError(
+                domain: "DiagnosticsExport",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "无法生成导出文件"]
+            )
+        }
+        try data.write(to: fileURL, options: .atomic)
+        return fileURL
+    }
+
+    private func formattedEntriesText(_ entries: [DiagnosticLogEntry]) -> String {
+        if entries.isEmpty {
+            return "最近 7 天暂无诊断日志"
+        }
+        return entries.map(formattedEntry).joined(separator: "\n\n")
+    }
+
+    private func formattedEntry(_ entry: DiagnosticLogEntry) -> String {
+        var lines = [
+            "[\(levelTitle(entry.level))] \(entry.createdAt.formatted(date: .abbreviated, time: .standard))",
+            "模块: \(entry.domain)",
+            "摘要: \(entry.message)"
+        ]
+
+        if !entry.metadata.isEmpty {
+            let metadataText = entry.metadata
+                .sorted { $0.key < $1.key }
+                .map { "\($0.key)=\($0.value)" }
+                .joined(separator: ", ")
+            lines.append("详情: \(metadataText)")
+        }
+
+        return lines.joined(separator: "\n")
+    }
+
+    private func levelTitle(_ level: DiagnosticLogLevel) -> String {
+        switch level {
+        case .info: return "INFO"
+        case .warning: return "WARN"
+        case .error: return "ERROR"
+        }
+    }
+
+    private func levelColor(_ level: DiagnosticLogLevel) -> Color {
+        switch level {
+        case .info: return .blue
+        case .warning: return .orange
+        case .error: return .red
+        }
+    }
+}
+
+struct ActivityView: UIViewControllerRepresentable {
+    let activityItems: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
 }
 
 struct ScheduledDeliveryView: View {
