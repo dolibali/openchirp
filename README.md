@@ -17,17 +17,21 @@
 
 ## 预览
 
-截图目录已预留在：
+**主页**
 
-[`docs/images`](./docs/images)
+![ChirpAI Home](./docs/images/chirpai-home.png)
 
-后续需要把真实截图放进去，并取消下面这段注释式占位：
+**设置页**
 
-```md
-[//]: # (![ChirpAI Home](./docs/images/chirpai-home.png))
-[//]: # (![ChirpAI Settings](./docs/images/chirpai-settings.png))
-[//]: # (![ChirpAI Feedback Loop](./docs/images/chirpai-feedback-loop.png))
-```
+![ChirpAI Settings](./docs/images/chirpai-settings.png)
+
+**用户反馈记录**
+
+![ChirpAI Feedback Loop](./docs/images/chirpai-feedback-loop.png)
+
+**用户画像**
+
+![ChirpAI User Persona](./docs/images/user-persona.png)
 
 ## 核心理念
 
