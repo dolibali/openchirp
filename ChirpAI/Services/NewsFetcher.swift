@@ -111,6 +111,10 @@ class NewsFetcher: ObservableObject {
 
         appendLog("🧹 清理历史冗余...")
         deleteOldNewsItems()
+        let cleanedSeenNewsCount = preferenceManager.cleanupExpiredSeenNews()
+        if cleanedSeenNewsCount > 0 {
+            appendLog("♻️ 已清理 \(cleanedSeenNewsCount) 条过期已读记录")
+        }
 
         currentStage = .fetchingRSS
         appendLog("🚀 初始化 RSS 探针...")

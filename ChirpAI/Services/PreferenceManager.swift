@@ -73,7 +73,7 @@ class PreferenceManager {
         }
     }
 
-    func cleanupExpiredSeenNews() {
+    func cleanupExpiredSeenNews() -> Int {
         let now = Date()
         let descriptor = FetchDescriptor<SeenNews>(
             predicate: #Predicate { $0.expireAt < now }
@@ -86,12 +86,14 @@ class PreferenceManager {
             if !expired.isEmpty {
                 try modelContext.save()
             }
+            return expired.count
         } catch {
             diagnostics.error(
                 domain: "storage",
                 message: "清理过期已读记录失败",
                 metadata: ["error": error.localizedDescription]
             )
+            return 0
         }
     }
 
